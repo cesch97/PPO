@@ -4,7 +4,7 @@ Helpers for dealing with vectorized environments.
 
 from collections import OrderedDict
 
-import gym
+import gymnasium as gym
 import numpy as np
 
 
@@ -15,7 +15,7 @@ def copy_obs_dict(obs):
     :param obs: (OrderedDict<ndarray>): a dict of numpy arrays.
     :return (OrderedDict<ndarray>) a dict of copied numpy arrays.
     """
-    assert isinstance(obs, OrderedDict), "unexpected type for observations '{}'".format(type(obs))
+    assert isinstance(obs, (dict, OrderedDict)), "unexpected type for observations '{}'".format(type(obs))
     return OrderedDict([(k, np.copy(v)) for k, v in obs.items()])
 
 
@@ -56,7 +56,7 @@ def obs_space_info(obs_space):
         dtypes: a dict mapping keys to dtypes.
     """
     if isinstance(obs_space, gym.spaces.Dict):
-        assert isinstance(obs_space.spaces, OrderedDict), "Dict space must have ordered subspaces"
+        assert isinstance(obs_space.spaces, dict), "Dict space must have ordered subspaces"
         subspaces = obs_space.spaces
     elif isinstance(obs_space, gym.spaces.Tuple):
         subspaces = {i: space for i, space in enumerate(obs_space.spaces)}

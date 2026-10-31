@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
@@ -5,11 +6,11 @@ from torch.distributions import Normal
 
 def init_extractor_weights(m):
     if isinstance(m, nn.Conv2d):
-        nn.init.orthogonal_(m.weight, torch.sqrt(torch.tensor((2.,))).item())
+        nn.init.orthogonal_(m.weight, math.sqrt(2.))
         if m.bias is not None:
             nn.init.zeros_(m.bias)
     if isinstance(m, nn.Linear):
-        nn.init.orthogonal_(m.weight, torch.sqrt(torch.tensor((2.,))).item())
+        nn.init.orthogonal_(m.weight, math.sqrt(2.))
         nn.init.zeros_(m.bias)
 
 def init_crtic_weights(m):
@@ -43,7 +44,7 @@ class CnnExtractor(nn.Module):
         self.linear_feature = 512
 
     def forward(self, x):
-        return self.fc(self.cnn(x).view(-1, self.cnn_flatten))
+        return self.fc(self.cnn(x).reshape(-1, self.cnn_flatten))
 
     def feature_size(self):
         with torch.no_grad():
@@ -92,12 +93,11 @@ class ActorCritic(nn.Module):
         if not deterministic:
             dist = self.norm_dist(out)
             if action:
-                dist.loc, dist.scale = dist.loc.cpu(), dist.scale.cpu()
                 sample = dist.sample()
                 if self.discrete:
-                    action = torch.argmax(sample, dim=1).numpy()
+                    action = torch.argmax(sample, dim=1).cpu().numpy()
                     return (dist, value), (sample, action)
-                action = sample.numpy()
+                action = sample.cpu().numpy()
                 return (dist, value), (sample, action)
         else:
             if self.discrete:
@@ -108,5 +108,5 @@ class ActorCritic(nn.Module):
         return dist, value
 
     def norm_dist(self, mu):
-        std = self.log_std.exp().expand_as(mu) * self.std_coef
+        std = self.log_std.exp().expand_as(mu) * self.std_coef.abs()
         return Normal(mu, std)

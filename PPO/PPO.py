@@ -5,17 +5,17 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 import multiprocessing as mp
 from PPO.multiprocessing_env import SubprocVecEnv
-from IPython.display import clear_output
+from IPython.display import clear_output, display
 import numpy as np
-from gym.spaces import Box
+from PIL import Image
+from gymnasium.spaces import Box
 import time
 
 
 def set_device(device):
     if device == 'auto':
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device == 'cpu':
-        return torch.device("cpu")
+    return torch.device(device)
 
 
 def compute_gae(next_value, rewards, masks, values, gamma, lam):
@@ -97,7 +97,7 @@ def ppo_update(dataloader, net, device, optimizer, lr, ppo_epochs, clip_range,
                 'std': state_dict['log_std'].exp().cpu()}
 
     if std_decay:
-        state_dict['std_coef'] = torch.tensor(1 - progress).to(device)
+        state_dict['std_coef'] = torch.tensor(max(1 - progress, 1e-3)).to(device)
     if clip_log_std is not None:
         state_dict['log_std'] = torch.clamp(state_dict['log_std'], max=clip_log_std)
     net.load_state_dict(state_dict)
@@ -119,11 +119,12 @@ def checkpoint_history(checkpoint):
         lr.append(record['lr'])
         clip_range.append(record['clip_range'])
         vf_coef.append(record['vf_coef'])
-        std_coef.append(record['std_coef'])
+        record_std_coef = record.get('std_coef', 1.0)
+        std_coef.append(record_std_coef)
         loss.append(record['loss'])
         critic_loss.append(record['critic_loss'] * record['vf_coef'])
         actor_loss.append(record['actor_loss'])
-        std.append(record['std'].mean().item() * record['std_coef'])
+        std.append(record['std'].mean().item() * record_std_coef if 'std' in record else float('nan'))
 
     return {'lr': lr,
             'clip_range': clip_range,
@@ -141,7 +142,6 @@ def plot(checkpoint, fps):
     frames, rewards = checkpoint['rewards']
     time_elapsed = checkpoint['time_elapsed']
     clear_output(True)
-    plt.clf()
     fig = plt.figure(constrained_layout=True)
     spec = fig.add_gridspec(ncols=1, nrows=3, height_ratios=[2, 1, 1], hspace=0)
     ax_reward = fig.add_subplot(spec[0, 0])
@@ -152,7 +152,8 @@ def plot(checkpoint, fps):
     ax_loss.plot(frames, data['actor_loss'])
     ax_std = fig.add_subplot(spec[2, 0])
     ax_std.plot(frames, data['std'])
-    plt.pause(0.01)
+    display(fig)
+    plt.close(fig)
     print('frames     : %i' % num_frames)
     print('time       : %i' % int(time_elapsed / 60))
     print('fps        : %i' % fps)
@@ -167,22 +168,40 @@ def plot(checkpoint, fps):
     print('std_coef   : %.3f' % data['std_coef'][-1])
 
 
-def run_test_env(env, model, runs_for_episode, n_episodes, vis=False, deterministic=False):
+def show_frame(env, handle, fps):
+    """Display the current frame of an env created with render_mode='rgb_array' inline in the notebook."""
+    frame = env.render()
+    if frame is None:
+        raise ValueError("vis=True requires an environment created with render_mode='rgb_array'")
+    image = Image.fromarray(frame)
+    if handle is None:
+        handle = display(image, display_id=True)
+    else:
+        handle.update(image)
+    if fps:
+        time.sleep(1 / fps)
+    return handle
+
+
+def run_test_env(env, model, runs_for_episode, n_episodes, vis=False, deterministic=False, fps=30):
+    """Run test episodes. With vis=True the env (render_mode='rgb_array') is rendered inline in the notebook."""
     rewards = []
+    handle = None
     for i in range(n_episodes):
-        state = env.reset()
-        if vis: env.render()
+        state, _ = env.reset()
+        if vis: handle = show_frame(env, handle, fps)
         done = False
         total_reward = 0
         for run in range(runs_for_episode):
             while not done:
                 action = model.predict(state, deterministic)
-                next_state, reward, done, _ = env.step(action)
+                next_state, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
                 state = next_state
                 if vis:
-                    env.render()
+                    handle = show_frame(env, handle, fps)
                 total_reward += reward
-            state = env.reset()
+            state, _ = env.reset()
             done = False
         rewards.append(total_reward)
     return np.mean(rewards)
@@ -216,14 +235,30 @@ class PPO(object):
 
     def load(self, file):
         self.make_net()
-        self.checkpoint = torch.load(file)
-        self.policy.load_state_dict(self.checkpoint['policy'])
+        self.checkpoint = torch.load(file, map_location=self.device, weights_only=False)
+
+        # checkpoints saved by older versions may lack some parameters (log_std, std_coef)
+        policy_state = self.checkpoint['policy']
+        missing = [k for k in self.policy.state_dict() if k not in policy_state]
+        if missing:
+            policy_state = {**self.policy.state_dict(), **policy_state}
+        self.policy.load_state_dict(policy_state)
+
         self.optimizer = optim.Adam(self.policy.parameters())
-        self.optimizer.load_state_dict(self.checkpoint['optimizer'])
+        if not missing:
+            self.optimizer.load_state_dict(self.checkpoint['optimizer'])
         self.frame_idx = self.checkpoint['frames']
         self.test_rewards = self.checkpoint['rewards']
         self.prev_time_elapsed = self.checkpoint['time_elapsed']
-        self.opt_info = self.checkpoint['opt_info']
+        self.opt_info = list(self.checkpoint.get('opt_info', []))
+
+        # keep opt_info aligned with the test rewards history used by plot()
+        n_missing = len(self.test_rewards[1]) - len(self.opt_info)
+        if n_missing > 0:
+            nan = float('nan')
+            empty_record = {'lr': nan, 'clip_range': nan, 'vf_coef': nan, 'std_coef': nan, 'loss': nan,
+                            'critic_loss': nan, 'actor_loss': nan, 'std': torch.full((1,), nan)}
+            self.opt_info = [dict(empty_record) for _ in range(n_missing)] + self.opt_info
 
     def predict(self, obs, deterministic=False):
         old_shape = obs.shape
@@ -285,14 +320,14 @@ class PPO(object):
                     (dist, value), (sample, action) = self.policy(state, action=True)
                     value = value.cpu()
                     next_state, reward, done, _ = envs.step(action)
-                    log_prob = dist.log_prob(sample)
+                    log_prob = dist.log_prob(sample).cpu()
                     entropy += dist.entropy().mean()
                     log_probs.append(log_prob)
                     values.append(value)
                     rewards.append(torch.FloatTensor(reward).unsqueeze(1))
                     masks.append(torch.FloatTensor(1 - done).unsqueeze(1))
                     states.append(state.cpu())
-                    actions.append(sample)
+                    actions.append(sample.cpu())
                     state = next_state
                     self.frame_idx += num_envs
 
@@ -309,7 +344,7 @@ class PPO(object):
             self.ppo_dataset.load_data(states, actions, log_probs, returns, advantage)
             _opt_info = ppo_update(self.ppo_dataloader, self.policy, self.device, self.optimizer, lr, ppo_epochs,
                                    clip_range, vf_coef, ent_coef, clip_grad_norm,
-                                   progress=self.frame_idx/max_frames, std_decay=std_decay, clip_log_std=clip_log_std)
+                                   progress=min(self.frame_idx / max_frames, 1.0), std_decay=std_decay, clip_log_std=clip_log_std)
             ppo_cycles += 1
             if ppo_cycles % log_every == log_every - 1:
                 if test_env is None:
@@ -344,38 +379,4 @@ class PPO(object):
             self.opt_info.append(_opt_info)
             self.save(log_file)
             plot(self.checkpoint, fps)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        envs.close()

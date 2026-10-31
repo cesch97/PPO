@@ -1,20 +1,18 @@
 from PPO.wrappers import make_atari, CropScreen, wrap_deepmind, wrap_pytorch
 import matplotlib.pyplot as plt
 import numpy as np
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 
 
 class BreakoutContinuous(gym.Wrapper):
     def __init__(self, env):
-        super().__init__(self)
-        self.observation_space = env.observation_space
+        super().__init__(env)
         self.action_space = spaces.Box(low=-1, high=1, shape=(1,))
-        self.env = env
 
     def reset(self, **kwargs):
-        self.last_obs = self.env.reset(**kwargs)
-        return self.last_obs
+        self.last_obs, info = self.env.reset(**kwargs)
+        return self.last_obs, info
 
     def step(self, action):
         paddle_pos = self.get_paddle_pos(self.last_obs[-1])
@@ -29,11 +27,8 @@ class BreakoutContinuous(gym.Wrapper):
         else:
             print(' - ')
             action = 0
-        self.last_obs, reward, done, info = self.env.step(action)
-        return self.last_obs, reward, done, info
-
-    def render(self, mode='human', **kwargs):
-        return self.env.render(mode=mode, **kwargs)
+        self.last_obs, reward, terminated, truncated, info = self.env.step(action)
+        return self.last_obs, reward, terminated, truncated, info
 
     def get_paddle_pos(self, frame):
         pos = np.where(frame[83, :] > 0)[0]
@@ -66,10 +61,11 @@ def plot_frames(obs):
 
 
 
-env = make_env()
-print('obs_space:', env.observation_space)
-print('act_space:', env.action_space)
-obs = env.reset()
-for i in range(20):
-    obs, r, d, _ = env.step(0.5)
-plot_frames(obs)
+if __name__ == '__main__':
+    env = make_env()
+    print('obs_space:', env.observation_space)
+    print('act_space:', env.action_space)
+    obs, _ = env.reset()
+    for i in range(20):
+        obs, r, terminated, truncated, _ = env.step(0.5)
+    plot_frames(obs)

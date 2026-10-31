@@ -12,21 +12,30 @@ This is a simple but efficient implementation of the PPO algorithm by OpenAI. I 
   - **util_vec_env** (utility for multiprocessing_env)
   - **wrappers** (utility to wrap Atari games from Gym)
 
+## Setup
+
+The project uses [uv](https://docs.astral.sh/uv/) and [Gymnasium](https://gymnasium.farama.org/) (the maintained successor of OpenAI Gym; Atari games come from `ale-py`).
+
+```bash
+uv sync
+```
+
+Environments follow the Gymnasium API (`reset() -> (obs, info)`, `step() -> (obs, reward, terminated, truncated, info)`). To watch an agent inline in a notebook, create the environment with `render_mode='rgb_array'` and pass `vis=True` to `run_test_env` (frames are shown in the cell output, `fps` limits the playback speed).
+
 ## Use
 
 ### Import the necessary modules
 
 ```python
-import gym
-from PPO import PPO
-from PPO import run_test_env
-from wrappers import make_atari, wrap_deepmind, wrap_pytorch
+import gymnasium as gym
+from PPO.PPO import PPO, run_test_env
+from PPO.wrappers import make_atari, wrap_deepmind, wrap_pytorch
 ```
 
 ### Define the learning hyperparameters
 
 ```python
-max_frames = None                     # max number of frames for learning
+max_frames = int(1e7)                 # max number of frames for learning
 max_rewards = None                    # if specified, learning will be interrupted when the agent reaches the reward in a test
 num_steps = 128                       # number of steps to run for each environment before updating the policy
 num_envs = -1                         # number of environments to run in parallel (-1 uses all the CPU cores available)
@@ -37,12 +46,14 @@ lr = 2.5e-4                           # learning rate for the policy optimizatio
 vf_coef = 0.5                         # critic_loss weight in the objective function
 ent_coef = 0.01                       # entropy weight in the objective function
 gamma = 0.99                          # coefficient for general advantage estimation
-tau = 0.95                            # coefficient for general advantage estimation
-plot = True                           # if True, at every log the policy performance will be tested and historic test results will be plotted
-save = True                           # if True, at every log a checkpoint will be saved containing all the data to restart and continue the learning process or to use a trained agent
-log_every = 10                        # number of policy updates between each log
-test_runs = 5                         # number of episodes to run when testing the policy performance; the result is the mean between all the episode rewards
-log_file = None                       # checkpoint file name
+lam = 0.95                            # lambda coefficient for general advantage estimation
+clip_grad_norm = 0.5                  # max norm for gradient clipping
+std_decay = False                     # if True, the policy standard deviation decays linearly to 0 at max_frames
+clip_log_std = None                   # if specified, log_std is clipped to this maximum value after every update
+log_every = 10                        # number of policy updates between each log: the policy is tested, a checkpoint is saved and the history is plotted
+runs_for_episode = 1                  # number of test environment runs summed in each test episode
+test_episodes = 5                     # number of episodes to run when testing the policy performance; the result is the mean between all the episode rewards
+log_file = './logs/checkpoint.pth'    # checkpoint file name (contains all the data to restart the learning process or to use a trained agent)
 device = 'auto'                       # device to use for evaluation and optimization; 'auto' will use the GPU if available
 ```
 
@@ -50,10 +61,10 @@ device = 'auto'                       # device to use for evaluation and optimiz
 The learning environment needs to be a callable that returns a function to make a wrapped environment
 
 ```python
-def make_env():
+def make_env(render_mode=None):
     # return a function that makes a wrapped environment
     def _thunk():
-        env = make_atari('PongNoFrameskip-v4')
+        env = make_atari('PongNoFrameskip-v4', render_mode=render_mode)
         env = wrap_deepmind(env, episode_life=True, clip_rewards=True, frame_stack=True, scale=True)
         env = wrap_pytorch(env)
         return env
@@ -61,9 +72,9 @@ def make_env():
 ```
 The testing environment is a simple environment that could be wrapped differently from the learning environment for better metrics
 ```python
-def make_test_env():
+def make_test_env(render_mode=None):
     # return a wrapped environment
-    env = make_atari('PongNoFrameskip-v4')
+    env = make_atari('PongNoFrameskip-v4', render_mode=render_mode)
     env = wrap_deepmind(env, episode_life=False, clip_rewards=False, frame_stack=True, scale=True)
     env = wrap_pytorch(env)
     return env
@@ -88,8 +99,9 @@ ppo.load(log_file)
 ```python
 ppo.learn(
     max_frames, max_rewards=max_rewards, num_steps=num_steps, num_envs=num_envs, batch_size=batch_size,
-    ppo_epochs=ppo_epochs, clip_range=clip_range, lr=lr, vf_coef=vf_coef, ent_coef=ent_coef, gamma=gamma, tau=tau,
-    log_every=log_every, plot=plot, save=save, log_file=log_file, test_env=make_test_env(), test_runs=test_runs
+    ppo_epochs=ppo_epochs, clip_range=clip_range, lr=lr, vf_coef=vf_coef, ent_coef=ent_coef, gamma=gamma, lam=lam,
+    clip_grad_norm=clip_grad_norm, std_decay=std_decay, clip_log_std=clip_log_std, log_every=log_every,
+    log_file=log_file, test_env=make_test_env(), runs_for_episode=runs_for_episode, test_episodes=test_episodes
 )
 ```
 
@@ -98,12 +110,12 @@ ppo.learn(
 ppo = PPO(make_env, device='cpu')
 ppo.load(log_file)
 
-env = make_env()()
-# env = make_test_env()
+env = make_env(render_mode='rgb_array')()
+# env = make_test_env(render_mode='rgb_array')
 n_episode = 3
 
 # if deterministic is True, the policy predictions will not be stochastic, which could improve performance
-mean_reward = run_test_env(env=env, model=ppo, n_runs=n_episode, vis=True, deterministic=False)
+mean_reward = run_test_env(env=env, model=ppo, runs_for_episode=1, n_episodes=n_episode, vis=True, deterministic=False)
 env.close()
 
 print('Mean reward over %i episodes = %f' % (n_episode, mean_reward))

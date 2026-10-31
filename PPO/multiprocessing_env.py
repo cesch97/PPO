@@ -2,7 +2,7 @@
 #https://github.com/openai/baselines/tree/master/baselines/common/vec_env
 
 import numpy as np
-from multiprocessing import Process, Pipe
+import multiprocessing as mp
 from collections import OrderedDict
 from PPO.util_vec_env import obs_space_info, copy_obs_dict, dict_to_obs
 
@@ -12,17 +12,16 @@ def worker(remote, parent_remote, env_fn_wrapper):
     while True:
         cmd, data = remote.recv()
         if cmd == 'step':
-            ob, reward, done, info = env.step(data)
+            ob, reward, terminated, truncated, info = env.step(data)
+            done = terminated or truncated
             if done:
-                ob = env.reset()
+                ob, _ = env.reset()
             remote.send((ob, reward, done, info))
         elif cmd == 'reset':
-            ob = env.reset()
-            remote.send(ob)
-        elif cmd == 'reset_task':
-            ob = env.reset_task()
+            ob, _ = env.reset()
             remote.send(ob)
         elif cmd == 'close':
+            env.close()
             remote.close()
             break
         elif cmd == 'get_spaces':
@@ -105,8 +104,10 @@ class SubprocVecEnv(VecEnv):
         self.closed = False
         nenvs = len(env_fns)
         self.nenvs = nenvs
-        self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(nenvs)])
-        self.ps = [Process(target=worker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
+        # spawn is used because forking a process that already runs torch threads can deadlock
+        ctx = mp.get_context('spawn')
+        self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(nenvs)])
+        self.ps = [ctx.Process(target=worker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
             for (work_remote, remote, env_fn) in zip(self.work_remotes, self.remotes, env_fns)]
         for p in self.ps:
             p.daemon = True # if the main process crashes, we should not cause things to hang
@@ -134,11 +135,6 @@ class SubprocVecEnv(VecEnv):
             remote.send(('reset', None))
         return np.stack([remote.recv() for remote in self.remotes])
 
-    def reset_task(self):
-        for remote in self.remotes:
-            remote.send(('reset_task', None))
-        return np.stack([remote.recv() for remote in self.remotes])
-
     def close(self):
         if self.closed:
             return
@@ -149,7 +145,7 @@ class SubprocVecEnv(VecEnv):
             remote.send(('close', None))
         for p in self.ps:
             p.join()
-            self.closed = True
+        self.closed = True
             
     def __len__(self):
         return self.nenvs
@@ -174,7 +170,7 @@ class DummyVecEnv(VecEnv):
         self.buf_obs = OrderedDict([
             (k, np.zeros((self.num_envs,) + tuple(shapes[k]), dtype=dtypes[k]))
             for k in self.keys])
-        self.buf_dones = np.zeros((self.num_envs,), dtype=np.bool)
+        self.buf_dones = np.zeros((self.num_envs,), dtype=bool)
         self.buf_rews = np.zeros((self.num_envs,), dtype=np.float32)
         self.buf_infos = [{} for _ in range(self.num_envs)]
         self.actions = None
@@ -185,19 +181,20 @@ class DummyVecEnv(VecEnv):
 
     def step_wait(self):
         for env_idx in range(self.num_envs):
-            obs, self.buf_rews[env_idx], self.buf_dones[env_idx], self.buf_infos[env_idx] =\
+            obs, self.buf_rews[env_idx], terminated, truncated, self.buf_infos[env_idx] =\
                 self.envs[env_idx].step(self.actions[env_idx])
+            self.buf_dones[env_idx] = terminated or truncated
             if self.buf_dones[env_idx]:
                 # save final observation where user can get it, then reset
                 self.buf_infos[env_idx]['terminal_observation'] = obs
-                obs = self.envs[env_idx].reset()
+                obs, _ = self.envs[env_idx].reset()
             self._save_obs(env_idx, obs)
         return (self._obs_from_buf(), np.copy(self.buf_rews), np.copy(self.buf_dones),
                 self.buf_infos.copy())
 
     def reset(self):
         for env_idx in range(self.num_envs):
-            obs = self.envs[env_idx].reset()
+            obs, _ = self.envs[env_idx].reset()
             self._save_obs(env_idx, obs)
         return self._obs_from_buf()
 
@@ -206,13 +203,12 @@ class DummyVecEnv(VecEnv):
             env.close()
 
     def get_images(self):
-        return [env.render(mode='rgb_array') for env in self.envs]
+        return [env.render() for env in self.envs]
 
     def render(self, *args, **kwargs):
         if self.num_envs == 1:
             return self.envs[0].render(*args, **kwargs)
-        else:
-            return super().render(*args, **kwargs)
+        raise NotImplementedError('render is only supported with a single environment, use get_images instead')
 
     def _save_obs(self, env_idx, obs):
         for key in self.keys:
@@ -239,6 +235,13 @@ class DummyVecEnv(VecEnv):
         """Call instance methods of vectorized environments."""
         target_envs = self._get_target_envs(indices)
         return [getattr(env_i, method_name)(*method_args, **method_kwargs) for env_i in target_envs]
+
+    def _get_indices(self, indices):
+        if indices is None:
+            return range(self.num_envs)
+        if isinstance(indices, int):
+            return [indices]
+        return indices
 
     def _get_target_envs(self, indices):
         indices = self._get_indices(indices)
