@@ -1,7 +1,7 @@
 import math
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
+from torch.distributions import Categorical, Normal
 
 
 def init_extractor_weights(m):
@@ -44,6 +44,9 @@ class CnnExtractor(nn.Module):
         self.linear_feature = 512
 
     def forward(self, x):
+        # uint8 frames are scaled here so they can be stored and transferred in their compact form
+        if x.dtype == torch.uint8:
+            x = x.float() / 255.0
         return self.fc(self.cnn(x).reshape(-1, self.cnn_flatten))
 
     def feature_size(self):
@@ -86,27 +89,37 @@ class ActorCritic(nn.Module):
         self.std_coef = nn.Parameter(torch.tensor(1).float(), requires_grad=False)
         self.discrete = discrete
 
-    def forward(self, x, action=False, deterministic=False):
-        x = self.feature_ext(x)
-        value = self.critic(x)
-        out = self.actor(x)
-        if not deterministic:
-            dist = self.norm_dist(out)
-            if action:
-                sample = dist.sample()
-                if self.discrete:
-                    action = torch.argmax(sample, dim=1).cpu().numpy()
-                    return (dist, value), (sample, action)
-                action = sample.cpu().numpy()
-                return (dist, value), (sample, action)
-        else:
-            if self.discrete:
-                action = torch.argmax(out, dim=1).cpu().numpy()
-                return (None, value), (None, action)
-            else:
-                return (None, value), (None, out.cpu().numpy())
-        return dist, value
+    def forward(self, x):
+        features = self.feature_ext(x)
+        return self.distribution(self.actor(features)), self.critic(features).squeeze(-1)
 
-    def norm_dist(self, mu):
-        std = self.log_std.exp().expand_as(mu) * self.std_coef.abs()
-        return Normal(mu, std)
+    def distribution(self, out):
+        if self.discrete:
+            return Categorical(logits=out)
+        std = self.log_std.exp().expand_as(out) * self.std_coef.abs()
+        return Normal(out, std)
+
+    def get_value(self, x):
+        return self.critic(self.feature_ext(x)).squeeze(-1)
+
+    def act(self, x, deterministic=False):
+        """Return (action, log_prob, value) for a batch of observations."""
+        dist, value = self(x)
+        if deterministic:
+            action = dist.mode
+        else:
+            action = dist.sample()
+        return action, self.log_prob(dist, action), value
+
+    def evaluate(self, x, action):
+        """Return (log_prob, entropy, value) of the given actions."""
+        dist, value = self(x)
+        return self.log_prob(dist, action), self.entropy(dist), value
+
+    def log_prob(self, dist, action):
+        log_prob = dist.log_prob(action)
+        return log_prob if self.discrete else log_prob.sum(-1)
+
+    def entropy(self, dist):
+        entropy = dist.entropy()
+        return entropy if self.discrete else entropy.sum(-1)

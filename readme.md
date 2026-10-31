@@ -48,12 +48,13 @@ ent_coef = 0.01                       # entropy weight in the objective function
 gamma = 0.99                          # coefficient for general advantage estimation
 lam = 0.95                            # lambda coefficient for general advantage estimation
 clip_grad_norm = 0.5                  # max norm for gradient clipping
-std_decay = False                     # if True, the policy standard deviation decays linearly to 0 at max_frames
-clip_log_std = None                   # if specified, log_std is clipped to this maximum value after every update
+std_decay = False                     # if True, the std of a continuous policy decays linearly to 0 at max_frames (no effect on discrete actions)
+clip_log_std = None                   # if specified, log_std is clipped to this maximum value after every update (continuous actions only)
 log_every = 10                        # number of policy updates between each log: the policy is tested, a checkpoint is saved and the history is plotted
 runs_for_episode = 1                  # number of test environment runs summed in each test episode
 test_episodes = 5                     # number of episodes to run when testing the policy performance; the result is the mean between all the episode rewards
-log_file = './logs/checkpoint.pth'    # checkpoint file name (contains all the data to restart the learning process or to use a trained agent)
+log_file = './logs/checkpoint.pth'    # checkpoint file name (contains all the data to restart the learning process or to use a trained agent); None disables saving
+vec_env = 'auto'                      # 'subproc' (one process per environment), 'dummy' (sequential, faster for cheap environments) or 'auto' ('dummy' for vector observations, 'subproc' for images)
 device = 'auto'                       # device to use for evaluation and optimization; 'auto' will use the GPU if available
 ```
 
@@ -65,17 +66,18 @@ def make_env(render_mode=None):
     # return a function that makes a wrapped environment
     def _thunk():
         env = make_atari('PongNoFrameskip-v4', render_mode=render_mode)
-        env = wrap_deepmind(env, episode_life=True, clip_rewards=True, frame_stack=True, scale=True)
+        env = wrap_deepmind(env, episode_life=True, clip_rewards=True, frame_stack=True)
         env = wrap_pytorch(env)
         return env
     return _thunk
 ```
+Image observations are best kept as `uint8` (no `scale=True`): the network divides them by 255 itself, which makes rollouts and inter-process transfers 4x smaller.
 The testing environment is a simple environment that could be wrapped differently from the learning environment for better metrics
 ```python
 def make_test_env(render_mode=None):
     # return a wrapped environment
     env = make_atari('PongNoFrameskip-v4', render_mode=render_mode)
-    env = wrap_deepmind(env, episode_life=False, clip_rewards=False, frame_stack=True, scale=True)
+    env = wrap_deepmind(env, episode_life=False, clip_rewards=False, frame_stack=True)
     env = wrap_pytorch(env)
     return env
 ```

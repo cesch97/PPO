@@ -1,33 +1,51 @@
 #This code is from openai baseline
 #https://github.com/openai/baselines/tree/master/baselines/common/vec_env
 
+import traceback
 import numpy as np
 import multiprocessing as mp
 from collections import OrderedDict
 from PPO.util_vec_env import obs_space_info, copy_obs_dict, dict_to_obs
 
 def worker(remote, parent_remote, env_fn_wrapper):
+    """
+    Every reply is a tuple (status, payload) with status 'ok' or 'error' (payload is the traceback),
+    so that an exception in the environment is re-raised in the parent instead of hanging it.
+    """
     parent_remote.close()
-    env = env_fn_wrapper.x()
+    try:
+        env = env_fn_wrapper.x()
+    except Exception:
+        env = None
+        init_error = traceback.format_exc()
     while True:
         cmd, data = remote.recv()
-        if cmd == 'step':
-            ob, reward, terminated, truncated, info = env.step(data)
-            done = terminated or truncated
-            if done:
-                ob, _ = env.reset()
-            remote.send((ob, reward, done, info))
-        elif cmd == 'reset':
-            ob, _ = env.reset()
-            remote.send(ob)
-        elif cmd == 'close':
-            env.close()
+        if cmd == 'close':
+            if env is not None:
+                env.close()
             remote.close()
             break
-        elif cmd == 'get_spaces':
-            remote.send((env.observation_space, env.action_space))
-        else:
-            raise NotImplementedError
+        try:
+            if env is None:
+                raise RuntimeError('environment creation failed:\n' + init_error)
+            if cmd == 'step':
+                ob, reward, terminated, truncated, _ = env.step(data)
+                info = {}
+                if truncated and not terminated:
+                    # the value of the cut-off state is needed to bootstrap (time limit is not a real terminal state)
+                    info['final_observation'] = ob
+                if terminated or truncated:
+                    ob, _ = env.reset()
+                remote.send(('ok', (ob, reward, terminated, truncated, info)))
+            elif cmd == 'reset':
+                ob, _ = env.reset()
+                remote.send(('ok', ob))
+            elif cmd == 'get_spaces':
+                remote.send(('ok', (env.observation_space, env.action_space)))
+            else:
+                raise NotImplementedError(cmd)
+        except Exception:
+            remote.send(('error', traceback.format_exc()))
 
 class VecEnv(object):
     """
@@ -61,12 +79,17 @@ class VecEnv(object):
     def step_wait(self):
         """
         Wait for the step taken with step_async().
-        Returns (obs, rews, dones, infos):
+        Returns (obs, rews, terminateds, truncateds, infos):
          - obs: an array of observations, or a tuple of
-                arrays of observations.
+                arrays of observations. Finished environments
+                are automatically reset and return the first
+                observation of the new episode.
          - rews: an array of rewards
-         - dones: an array of "episode done" booleans
-         - infos: a sequence of info objects
+         - terminateds: an array of "real end of episode" booleans
+         - truncateds: an array of "time limit reached" booleans
+         - infos: a sequence of dicts; an environment that was
+                truncated (and not terminated) stores the last
+                observation of the episode in 'final_observation'
         """
         pass
 
@@ -115,9 +138,32 @@ class SubprocVecEnv(VecEnv):
         for remote in self.work_remotes:
             remote.close()
 
-        self.remotes[0].send(('get_spaces', None))
-        observation_space, action_space = self.remotes[0].recv()
+        try:
+            self.remotes[0].send(('get_spaces', None))
+            observation_space, action_space = self._receive(self.remotes[0])
+        except Exception:
+            self._terminate()
+            raise
         VecEnv.__init__(self, len(env_fns), observation_space, action_space)
+
+    @staticmethod
+    def _receive(remote):
+        status, payload = remote.recv()
+        if status == 'error':
+            raise RuntimeError('Exception in environment worker:\n' + payload)
+        return payload
+
+    def _receive_all(self):
+        # every pending reply is read, even after a failure, to keep the pipes consistent
+        results, error = [], None
+        for remote in self.remotes:
+            try:
+                results.append(self._receive(remote))
+            except RuntimeError as e:
+                error = error or e
+        if error is not None:
+            raise error
+        return results
 
     def step_async(self, actions):
         for remote, action in zip(self.remotes, actions):
@@ -125,28 +171,38 @@ class SubprocVecEnv(VecEnv):
         self.waiting = True
 
     def step_wait(self):
-        results = [remote.recv() for remote in self.remotes]
-        self.waiting = False
-        obs, rews, dones, infos = zip(*results)
-        return np.stack(obs), np.stack(rews), np.stack(dones), infos
+        try:
+            results = self._receive_all()
+        finally:
+            self.waiting = False
+        obs, rews, terminateds, truncateds, infos = zip(*results)
+        return np.stack(obs), np.stack(rews), np.array(terminateds), np.array(truncateds), infos
 
     def reset(self):
         for remote in self.remotes:
             remote.send(('reset', None))
-        return np.stack([remote.recv() for remote in self.remotes])
+        return np.stack(self._receive_all())
+
+    def _terminate(self):
+        for p in self.ps:
+            if p.is_alive():
+                p.terminate()
+            p.join()
+        self.closed = True
 
     def close(self):
         if self.closed:
             return
-        if self.waiting:
-            for remote in self.remotes:            
-                remote.recv()
-        for remote in self.remotes:
-            remote.send(('close', None))
-        for p in self.ps:
-            p.join()
-        self.closed = True
-            
+        try:
+            if self.waiting:
+                self._receive_all()
+            for remote in self.remotes:
+                remote.send(('close', None))
+            for p in self.ps:
+                p.join(timeout=10)
+        except (RuntimeError, OSError, EOFError):
+            pass
+        self._terminate()
     def __len__(self):
         return self.nenvs
 
@@ -170,7 +226,8 @@ class DummyVecEnv(VecEnv):
         self.buf_obs = OrderedDict([
             (k, np.zeros((self.num_envs,) + tuple(shapes[k]), dtype=dtypes[k]))
             for k in self.keys])
-        self.buf_dones = np.zeros((self.num_envs,), dtype=bool)
+        self.buf_terminateds = np.zeros((self.num_envs,), dtype=bool)
+        self.buf_truncateds = np.zeros((self.num_envs,), dtype=bool)
         self.buf_rews = np.zeros((self.num_envs,), dtype=np.float32)
         self.buf_infos = [{} for _ in range(self.num_envs)]
         self.actions = None
@@ -181,16 +238,17 @@ class DummyVecEnv(VecEnv):
 
     def step_wait(self):
         for env_idx in range(self.num_envs):
-            obs, self.buf_rews[env_idx], terminated, truncated, self.buf_infos[env_idx] =\
-                self.envs[env_idx].step(self.actions[env_idx])
-            self.buf_dones[env_idx] = terminated or truncated
-            if self.buf_dones[env_idx]:
-                # save final observation where user can get it, then reset
-                self.buf_infos[env_idx]['terminal_observation'] = obs
+            obs, self.buf_rews[env_idx], terminated, truncated, _ = self.envs[env_idx].step(self.actions[env_idx])
+            self.buf_terminateds[env_idx] = terminated
+            self.buf_truncateds[env_idx] = truncated
+            self.buf_infos[env_idx] = {}
+            if truncated and not terminated:
+                self.buf_infos[env_idx]['final_observation'] = obs
+            if terminated or truncated:
                 obs, _ = self.envs[env_idx].reset()
             self._save_obs(env_idx, obs)
-        return (self._obs_from_buf(), np.copy(self.buf_rews), np.copy(self.buf_dones),
-                self.buf_infos.copy())
+        return (self._obs_from_buf(), np.copy(self.buf_rews), np.copy(self.buf_terminateds),
+                np.copy(self.buf_truncateds), self.buf_infos.copy())
 
     def reset(self):
         for env_idx in range(self.num_envs):
