@@ -1,0 +1,20 @@
+[project]
+name = "ppo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "fabio", email = "fabio.cescon@outlook.it" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=7.4.0",
+    "torch>=2.15.0",
+]
+
+[project.scripts]
+ppo = "ppo:main"
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"
