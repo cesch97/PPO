@@ -52,21 +52,32 @@ def compute_gae(rewards, values, masks, next_value, gamma, lam):
 
 
 def ppo_update(states, actions, old_log_probs, returns, advantages, net, optimizer, lr, batch_size, ppo_epochs,
-               clip_range, vf_coef, ent_coef, clip_grad_norm, progress, std_decay, clip_log_std=None):
-    """All the rollout tensors live on the same device as the network and have the batch as first dimension."""
+               clip_range, vf_coef, ent_coef, clip_grad_norm, progress, std_decay, clip_log_std=None,
+               action_masks=None, target_kl=None):
+    """
+    All the rollout tensors live on the same device as the network and have the batch as first dimension.
+    action_masks: optional boolean tensor of the legal actions of every sample, passed to net.evaluate.
+    target_kl: if specified, the update is stopped as soon as the approximate KL divergence from the policy that
+    collected the data exceeds 1.5 * target_kl.
+    """
     lr = schedule(lr, progress)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     clip_range = schedule(clip_range, progress)
 
     num_samples = states.shape[0]
-    stats = torch.zeros(5, device=states.device)  # loss, critic_loss, actor_loss, approx_kl, clip_fraction
+    # loss, critic_loss, actor_loss, approx_kl, clip_fraction, entropy
+    stats = torch.zeros(6, device=states.device)
     num_batches = 0
+    stop = False
     for _ in range(ppo_epochs):
         permutation = torch.randperm(num_samples, device=states.device)
         for start in range(0, num_samples, batch_size):
             idx = permutation[start:start + batch_size]
-            new_log_probs, entropy, value = net.evaluate(states[idx], actions[idx])
+            if action_masks is None:
+                new_log_probs, entropy, value = net.evaluate(states[idx], actions[idx])
+            else:
+                new_log_probs, entropy, value = net.evaluate(states[idx], actions[idx], action_masks[idx])
             log_ratio = new_log_probs - old_log_probs[idx]
             ratio = log_ratio.exp()
             advantage = advantages[idx]
@@ -84,26 +95,33 @@ def ppo_update(states, actions, old_log_probs, returns, advantages, net, optimiz
             with torch.no_grad():
                 approx_kl = ((ratio - 1) - log_ratio).mean()
                 clip_fraction = ((ratio - 1).abs() > clip_range).float().mean()
-                stats += torch.stack([loss, critic_loss, actor_loss, approx_kl, clip_fraction])
+                stats += torch.stack([loss, critic_loss, actor_loss, approx_kl, clip_fraction, entropy.mean()])
+                stop = target_kl is not None and approx_kl.item() > 1.5 * target_kl
             num_batches += 1
+            if stop:
+                break
+        if stop:
+            break
 
-    loss, critic_loss, actor_loss, approx_kl, clip_fraction = (stats / num_batches).tolist()
+    loss, critic_loss, actor_loss, approx_kl, clip_fraction, entropy = (stats / num_batches).tolist()
+    # networks for discrete actions that have no std (e.g. the chess one) just report the defaults
     opt_info = {'lr': lr,
                 'clip_range': clip_range,
                 'vf_coef': vf_coef,
-                'std_coef': net.std_coef.item(),
+                'std_coef': net.std_coef.item() if hasattr(net, 'std_coef') else 1.0,
                 'loss': loss,
                 'critic_loss': critic_loss,
                 'actor_loss': actor_loss,
                 'approx_kl': approx_kl,
                 'clip_fraction': clip_fraction,
-                'std': net.log_std.detach().exp().cpu()}
+                'entropy': entropy,
+                'std': net.log_std.detach().exp().cpu() if hasattr(net, 'log_std') else torch.ones(1)}
 
     with torch.no_grad():
         # the std only exists for continuous actions
         if std_decay and not net.discrete:
             net.std_coef.fill_(max(1 - progress, 1e-3))
-        if clip_log_std is not None:
+        if clip_log_std is not None and hasattr(net, 'log_std'):
             net.log_std.clamp_(max=clip_log_std)
 
     return opt_info

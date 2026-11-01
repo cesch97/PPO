@@ -11,6 +11,12 @@ This is a simple but efficient implementation of the PPO algorithm by OpenAI. I 
   - **multiprocessing_env** (utility to parallelize training across the CPU cores)
   - **util_vec_env** (utility for multiprocessing_env)
   - **wrappers** (utility to wrap Atari games from Gym)
+  - **chess_engine.c / chess_env** (vectorized chess environment: C bitboard engine called through `ctypes`)
+  - **chess_policy** (residual CNN actor-critic with legal-move masking)
+  - **selfplay** (self-play PPO trainer, opponent pool, evaluation)
+  - **chess_ui** (agent vs agent and agent vs human in a notebook)
+- **Chess-selfplay.ipynb** - train, evaluate and play against the chess agent
+- **tests** - `uv run pytest tests`
 
 ## Setup
 
@@ -122,3 +128,23 @@ env.close()
 
 print('Mean reward over %i episodes = %f' % (n_episode, mean_reward))
 ```
+
+## Chess with self-play
+
+See [Chess-selfplay.ipynb](Chess-selfplay.ipynb). Design notes:
+
+- **Environment**: `ChessVecEnv` keeps all the boards in one numpy buffer and steps/observes them with C code from a
+  thread pool (`ctypes` releases the GIL): a single interpreter, no worker processes, ~few KB per game, ~0.5M
+  half-moves/s on 16 threads. The C file is compiled on first import (system `cc`/`gcc`/`clang`, otherwise the C compiler
+  of the `ziglang` wheel) and cached in `PPO/_build`. Move generation is checked with perft and against `python-chess`.
+  Observations (21 planes) and the 4672 actions (AlphaZero encoding) are always from the point of view of the player to
+  move, so one network plays both colours.
+- **Self-play PPO**: negamax GAE (zero-sum, the next state counts with a negative sign), legal-move masks stored in the
+  rollout, time-limit bootstrapping, random openings, GroupNorm network (batch independent log-probabilities), optional
+  KL early stopping.
+- **Opponents**: the current network, a pool of past snapshots (sampled more often when they are harder to beat, which
+  fights strategy cycling / forgetting) and baseline engines (random, alpha-beta depth 1-2). The mix is scheduled:
+  many engine games at the beginning, pure self-play at the end. Only the learner's moves are trained on.
+- **Reward**: +1 for checkmate, 0 for a draw. For bootstrapping, annealed to zero: potential-based shaping on the material
+  balance and on the mating technique (weaker king pushed to the edge, kings close), plus a penalty for drawing
+  (stalemate, repetition, ...) while ahead in material.
