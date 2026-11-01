@@ -89,9 +89,14 @@ class ActorCritic(nn.Module):
         self.std_coef = nn.Parameter(torch.tensor(1).float(), requires_grad=False)
         self.discrete = discrete
 
-    def forward(self, x):
+    def raw_outputs(self, x):
+        """(action logits or means, value) as plain tensors."""
         features = self.feature_ext(x)
-        return self.distribution(self.actor(features)), self.critic(features).squeeze(-1)
+        return self.actor(features), self.critic(features).squeeze(-1)
+
+    def forward(self, x):
+        out, value = self.raw_outputs(x)
+        return self.distribution(out), value
 
     def distribution(self, out):
         if self.discrete:

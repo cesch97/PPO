@@ -2,3 +2,4 @@ PPO/_build/
 logs/trial*
 logs/diag*
 .pytest_cache/
+logs/tb/

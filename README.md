@@ -14,6 +14,7 @@ This is a simple but efficient implementation of the PPO algorithm by OpenAI. I 
   - **chess_engine.c / chess_env** (vectorized chess environment: C bitboard engine called through `ctypes`)
   - **chess_policy** (residual CNN actor-critic with legal-move masking)
   - **selfplay** (self-play PPO trainer, opponent pool, evaluation)
+  - **tensorboard_logger** (TensorBoard logging shared by both trainers)
   - **chess_ui** (agent vs agent and agent vs human in a notebook)
 - **Chess-selfplay.ipynb** - train, evaluate and play against the chess agent
 - **tests** - `uv run pytest tests`
@@ -60,6 +61,7 @@ log_every = 10                        # number of policy updates between each lo
 runs_for_episode = 1                  # number of test environment runs summed in each test episode
 test_episodes = 5                     # number of episodes to run when testing the policy performance; the result is the mean between all the episode rewards
 log_file = './logs/checkpoint.pth'    # checkpoint file name (contains all the data to restart the learning process or to use a trained agent); None disables saving
+tensorboard = './logs/tb/checkpoint'  # directory of the TensorBoard logs, None disables them (see "TensorBoard" below)
 vec_env = 'auto'                      # 'subproc' (one process per environment), 'dummy' (sequential, faster for cheap environments) or 'auto' ('dummy' for vector observations, 'subproc' for images)
 device = 'auto'                       # device to use for evaluation and optimization; 'auto' will use the GPU if available
 ```
@@ -109,9 +111,31 @@ ppo.learn(
     max_frames, max_rewards=max_rewards, num_steps=num_steps, num_envs=num_envs, batch_size=batch_size,
     ppo_epochs=ppo_epochs, clip_range=clip_range, lr=lr, vf_coef=vf_coef, ent_coef=ent_coef, gamma=gamma, lam=lam,
     clip_grad_norm=clip_grad_norm, std_decay=std_decay, clip_log_std=clip_log_std, log_every=log_every,
-    log_file=log_file, test_env=make_test_env(), runs_for_episode=runs_for_episode, test_episodes=test_episodes
+    log_file=log_file, test_env=make_test_env(), runs_for_episode=runs_for_episode, test_episodes=test_episodes,
+    tensorboard=tensorboard
 )
 ```
+
+### TensorBoard
+
+`PPO.learn` and `SelfPlayPPO.learn` accept `tensorboard=<log directory>`. It adds the TensorBoard logs to the notebook
+plots and printouts, which are unchanged. Start it in a terminal with `uv run tensorboard --logdir logs/tb` or in a
+notebook with `%load_ext tensorboard` and `%tensorboard --logdir logs/tb`. Use one directory per run: curves use the
+number of frames as step, so continuing a run from a checkpoint with the same directory continues its curves.
+
+- **Scalars** (a *Custom Scalars* tab groups the main curves): `train/` (losses, approx KL, clip fraction, entropy,
+  gradient norm, learning rate, ...), `rollout/` (episode return and length, explained variance of the critic, ...),
+  `eval/`, `time/` and `norms/` (weights and gradients, global and per module). Training metrics are written at every
+  update, evaluation and histograms every `log_every` updates. The chess agent adds the Elo against the baselines, how
+  the self-play games end, the opponent mix, the opponent pool and the shaping schedules.
+- **Distributions / Histograms**: every weight and gradient, plus the actions and values of the rollout.
+- **Text**: hyper-parameters, run info, the network architecture (`print(net)`), and the parameters of every module
+  and tensor.
+- **Graph**: the network graph. **Images**: a sample observation (stacked frames or board planes).
+- **HParams**: compare runs by their hyper-parameters (final metric: `eval/reward`, `eval/vs_<last baseline>` for chess).
+
+Pass a `PPO.tensorboard_logger.TensorBoardLogger(dir, histograms=False)` instead of a path to skip the histograms, which
+are the slowest part for big networks.
 
 ### Loading and testing a trained agent
 ```python

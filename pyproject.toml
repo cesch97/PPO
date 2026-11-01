@@ -17,6 +17,7 @@ dependencies = [
     "matplotlib>=3.11.2",
     "numpy>=2.5.4",
     "opencv-python-headless>=5.0.0.93",
+    "tensorboard>=2.21.0",
     "torch>=2.15.0",
     "ziglang>=0.17.0",
 ]

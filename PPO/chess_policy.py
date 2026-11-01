@@ -116,6 +116,10 @@ class ChessNet(nn.Module):
         logits = logits.float().permute(0, 2, 3, 1).reshape(x.shape[0], NUM_ACTIONS)
         return logits, value.float().squeeze(-1)
 
+    def raw_outputs(self, x):
+        """(unmasked action logits, value) as plain tensors."""
+        return self._features(x)
+
     def forward(self, x, mask=None):
         logits, value = self._features(x)
         if mask is not None:

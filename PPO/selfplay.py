@@ -28,9 +28,34 @@ from IPython.display import clear_output, display
 from PPO.PPO import ppo_update, schedule, set_device
 from PPO.chess_env import CHECKMATE, MAXPLIES, NUM_ACTIONS, NUM_PLANES, OUTCOME_NAMES, ChessVecEnv, encode_move
 from PPO.chess_policy import ChessNet
+from PPO.tensorboard_logger import TensorBoardLogger, explained_variance
 
 SELF, POOL, ENGINE = 0, 1, 2
 MATERIAL_SCALE = 39.0  # material of one side at the start (in pawns)
+
+# the curves shown together in the "Custom Scalars" tab of TensorBoard
+TENSORBOARD_LAYOUT = {
+    'Strength': {
+        'score against the baselines': ['Multiline', ['eval/vs_.*']],
+        'elo against the baselines': ['Multiline', ['elo/vs_.*']],
+        'score in the training games': ['Multiline', ['games/vs_.*']],
+    },
+    'Self-play': {
+        'how the games end': ['Multiline', ['selfplay/mate', 'selfplay/move_limit', 'selfplay/draw']],
+        'game length': ['Multiline', ['selfplay/game_len']],
+        'opponents of the games': ['Multiline', ['opponents/frac_.*']],
+        'opponent pool': ['Multiline', ['pool/size']],
+    },
+    'Optimisation': {
+        'losses': ['Multiline', ['train/loss', 'train/actor_loss', 'train/critic_loss']],
+        'policy update': ['Multiline', ['train/approx_kl', 'train/clip_fraction']],
+        'entropy': ['Multiline', ['train/entropy']],
+        'critic quality': ['Multiline', ['rollout/explained_variance']],
+        'gradients': ['Multiline', ['train/grad_norm', 'norms/global_grads']],
+        'reward shaping': ['Multiline', ['schedule/shaping', 'schedule/mate_shaping', 'schedule/draw_penalty']],
+    },
+    'Speed': {'frames per second': ['Multiline', ['time/fps']]},
+}
 
 
 @torch.no_grad()
@@ -238,7 +263,7 @@ class SelfPlayPPO:
               max_plies=200, open_plies=(0, 8), shaping='lin_1.0', mate_shaping='lin_0.5', draw_penalty='lin_0.5',
               p_self=0.5, p_pool=0.25, p_engine='lin_0.6', engine_depths=(0, 1, 2), engine_noise=30,
               snapshot_every=10, pool_size=8, log_every=10, log_file=None, eval_games=32, eval_depths=(0, 1, 2),
-              plot_progress=True, num_threads=None, seed=None):
+              plot_progress=True, num_threads=None, seed=None, tensorboard=None):
         """
         max_frames: total number of half-moves played by all the environments (counting the opponents' ones).
         num_steps: half-moves played by every environment between two updates (the batch has num_envs * num_steps).
@@ -253,7 +278,11 @@ class SelfPlayPPO:
             network is weak) and moves towards pure self-play.
         snapshot_every / pool_size: a snapshot of the network enters the pool every `snapshot_every` updates.
         eval_games / eval_depths: games played against each baseline at every log (the learning curve).
+        tensorboard: directory of the TensorBoard logs (or a TensorBoardLogger), in addition to the notebook plots.
+            The curves use the number of frames as step, so resuming a run with the same directory continues them.
         """
+        hparams = {k: v for k, v in locals().items() if k not in ('self', 'log_file', 'tensorboard')}
+        hparams.update(self.policy.config, amp=self.policy.amp)
         rng = np.random.default_rng(seed)
         if seed is not None:
             torch.manual_seed(seed)
@@ -302,8 +331,16 @@ class SelfPlayPPO:
         updates = 0
         start_cycle, start_cycle_frames = time.time(), self.frame_idx
 
+        tb = None
         try:
+            tb = TensorBoardLogger.resolve(tensorboard)
             env.reset()
+            if tb is not None:
+                tb.log_setup(policy, torch.from_numpy(env.obs[:1]).to(device), hparams,
+                             metrics=['eval/vs_%s' % ('random' if d == 0 else 'depth%i' % d) for d in eval_depths[-1:]]
+                             if eval_games else ['selfplay/mate'],
+                             layout=TENSORBOARD_LAYOUT, run_info={'resumed at frame': self.frame_idx})
+                tb.log_observation(env.obs[0])
             update_probs(min(self.frame_idx / max_frames, 1.0))
             assign(np.arange(N))
             while True:
@@ -390,6 +427,12 @@ class SelfPlayPPO:
                     batch = (obs_buf.flatten(0, 1)[selected], action_buf.flatten()[selected],
                              log_prob_buf.flatten()[selected], returns.flatten()[selected], adv,
                              mask_buf.flatten(0, 1)[selected])
+                    if tb is not None:
+                        rollout = {'learner_fraction': selected.float().mean().item(),
+                                   'explained_variance': explained_variance(value_buf.flatten()[selected],
+                                                                            returns.flatten()[selected]),
+                                   'value_mean': value_buf.flatten()[selected].mean().item(),
+                                   'reward_mean': rewards.flatten()[selected].mean().item()}
 
                 opt_info = ppo_update(batch[0], batch[1], batch[2], batch[3], batch[4], policy, self.optimizer, lr,
                                       min(batch_size, len(batch[0])), ppo_epochs, clip_range, vf_coef,
@@ -397,6 +440,14 @@ class SelfPlayPPO:
                                       action_masks=batch[5], target_kl=target_kl)
                 del batch
                 updates += 1
+                if tb is not None:
+                    tb.update(self.frame_idx, opt_info)
+                    tb.scalars(self.frame_idx, rollout, 'rollout/')
+                    tb.scalars(self.frame_idx, {'progress': progress, 'shaping': beta, 'mate_shaping': beta_mate,
+                                                'draw_penalty': beta_draw, 'ent_coef': schedule(ent_coef, progress)},
+                               'schedule/')
+                    tb.scalars(self.frame_idx, dict(zip(('frac_self', 'frac_pool', 'frac_engine'),
+                                                        np.bincount(kind, minlength=3) / N)), 'opponents/')
                 if updates % snapshot_every == 0:
                     self.pool.add(policy, self.frame_idx)
 
@@ -405,14 +456,17 @@ class SelfPlayPPO:
                     now = time.time()
                     self.time_elapsed += now - start_cycle
                     fps = int((self.frame_idx - start_cycle_frames) / (now - start_cycle))
-                    self._log(opt_info, stats, beta, fps, eval_games, eval_depths, max_plies, log_file, plot_progress)
+                    self._log(opt_info, stats, beta, fps, eval_games, eval_depths, max_plies, log_file, plot_progress,
+                              tb)
                     start_cycle, start_cycle_frames = time.time(), self.frame_idx
                 if finished:
                     break
         finally:
+            if tb is not None and tb is not tensorboard:
+                tb.close()  # only the loggers created here are closed
             env.close()
 
-    def _log(self, opt_info, stats, beta, fps, eval_games, eval_depths, max_plies, log_file, plot_progress):
+    def _log(self, opt_info, stats, beta, fps, eval_games, eval_depths, max_plies, log_file, plot_progress, tb=None):
         reasons = Counter(stats['reason'])
         total = max(sum(reasons.values()), 1)
         self.history.append({
@@ -432,10 +486,25 @@ class SelfPlayPPO:
         })
         if log_file is not None:
             self.save(log_file)
+        if tb is not None:
+            self._log_tensorboard(tb, self.history[-1])
         if plot_progress:
             plot_history(self.history, self.time_elapsed)
         else:
             print_summary(self.history, self.time_elapsed)
+
+
+    def _log_tensorboard(self, tb, record):
+        step = record['frames']
+        tb.scalars(step, {'fps': record['fps'], 'minutes': self.time_elapsed / 60}, 'time/')
+        tb.scalars(step, {'vs_' + name: score for name, score in record['eval'].items()}, 'eval/')
+        tb.scalars(step, {'vs_' + name: elo_difference(score) for name, score in record['eval'].items()}, 'elo/')
+        tb.scalars(step, record['selfplay'], 'selfplay/')
+        tb.scalars(step, {'vs_pool': record['vs_pool'],
+                          **{'vs_depth%i' % depth: score for depth, score in record['vs_engine'].items()}}, 'games/')
+        tb.scalars(step, {'size': record['pool_size']}, 'pool/')
+        tb.weights(step, self.policy)
+        tb.flush()
 
 
 def plot_history(history, time_elapsed=None):

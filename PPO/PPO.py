@@ -9,6 +9,22 @@ import numpy as np
 from PIL import Image
 from gymnasium.spaces import Box
 import time
+from collections import deque
+
+from PPO.tensorboard_logger import TensorBoardLogger, explained_variance
+
+# the curves shown together in the "Custom Scalars" tab of TensorBoard
+TENSORBOARD_LAYOUT = {
+    'PPO': {
+        'reward': ['Multiline', ['eval/reward', 'rollout/ep_return_mean']],
+        'losses': ['Multiline', ['train/loss', 'train/actor_loss', 'train/critic_loss']],
+        'policy update': ['Multiline', ['train/approx_kl', 'train/clip_fraction']],
+        'entropy': ['Multiline', ['train/entropy']],
+        'critic quality': ['Multiline', ['rollout/explained_variance']],
+        'gradients': ['Multiline', ['train/grad_norm', 'norms/global_grads']],
+        'speed': ['Multiline', ['time/fps']],
+    },
+}
 
 
 def set_device(device):
@@ -66,8 +82,8 @@ def ppo_update(states, actions, old_log_probs, returns, advantages, net, optimiz
     clip_range = schedule(clip_range, progress)
 
     num_samples = states.shape[0]
-    # loss, critic_loss, actor_loss, approx_kl, clip_fraction, entropy
-    stats = torch.zeros(6, device=states.device)
+    # loss, critic_loss, actor_loss, approx_kl, clip_fraction, entropy, grad_norm (before clipping)
+    stats = torch.zeros(7, device=states.device)
     num_batches = 0
     stop = False
     for _ in range(ppo_epochs):
@@ -89,13 +105,14 @@ def ppo_update(states, actions, old_log_probs, returns, advantages, net, optimiz
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), clip_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), clip_grad_norm)
             optimizer.step()
 
             with torch.no_grad():
                 approx_kl = ((ratio - 1) - log_ratio).mean()
                 clip_fraction = ((ratio - 1).abs() > clip_range).float().mean()
-                stats += torch.stack([loss, critic_loss, actor_loss, approx_kl, clip_fraction, entropy.mean()])
+                stats += torch.stack([loss, critic_loss, actor_loss, approx_kl, clip_fraction, entropy.mean(),
+                                      grad_norm])
                 stop = target_kl is not None and approx_kl.item() > 1.5 * target_kl
             num_batches += 1
             if stop:
@@ -103,7 +120,7 @@ def ppo_update(states, actions, old_log_probs, returns, advantages, net, optimiz
         if stop:
             break
 
-    loss, critic_loss, actor_loss, approx_kl, clip_fraction, entropy = (stats / num_batches).tolist()
+    loss, critic_loss, actor_loss, approx_kl, clip_fraction, entropy, grad_norm = (stats / num_batches).tolist()
     # networks for discrete actions that have no std (e.g. the chess one) just report the defaults
     opt_info = {'lr': lr,
                 'clip_range': clip_range,
@@ -115,6 +132,8 @@ def ppo_update(states, actions, old_log_probs, returns, advantages, net, optimiz
                 'approx_kl': approx_kl,
                 'clip_fraction': clip_fraction,
                 'entropy': entropy,
+                'grad_norm': grad_norm,
+                'num_batches': num_batches,
                 'std': net.log_std.detach().exp().cpu() if hasattr(net, 'log_std') else torch.ones(1)}
 
     with torch.no_grad():
@@ -324,34 +343,47 @@ class PPO(object):
         action = self.to_env_action(action)
         return action[0] if single else action
 
-    def log_progress(self, eval_env, runs_for_episode, test_episodes, opt_info, fps, start_learning, log_file):
+    def log_progress(self, eval_env, runs_for_episode, test_episodes, opt_info, fps, start_learning, log_file,
+                     tb=None):
         test_reward = run_test_env(eval_env, self, runs_for_episode, test_episodes)
         self.test_rewards[0].append(self.frame_idx)
         self.test_rewards[1].append(float(test_reward))
         self.time_elapsed = time.time() - start_learning + self.prev_time_elapsed
         self.opt_info.append(opt_info)
         self.save(log_file)
+        if tb is not None:
+            tb.scalars(self.frame_idx, {'reward': test_reward}, 'eval/')
+            tb.scalars(self.frame_idx, {'fps': fps, 'minutes': self.time_elapsed / 60}, 'time/')
+            tb.weights(self.frame_idx, self.policy)
+            tb.flush()
         plot(self.checkpoint, fps)
         return test_reward
 
     def learn(self, max_frames, max_rewards=None, num_envs=-1, lr=2.5e-4, num_steps=128, batch_size=256, ppo_epochs=4,
               clip_range=0.2, vf_coef=0.5, ent_coef=0.01, gamma=0.99, lam=0.95, clip_grad_norm=0.5, std_decay=False,
               clip_log_std=None, log_every=10, log_file=None, test_env=None, runs_for_episode=1, test_episodes=5,
-              vec_env='auto'):
+              vec_env='auto', tensorboard=None):
         """
         vec_env: 'subproc' steps every environment in its own process, 'dummy' steps them sequentially in this
         process (faster for cheap environments); 'auto' uses 'dummy' for vector observations and 'subproc' for images.
+        tensorboard: directory of the TensorBoard logs (or a TensorBoardLogger), in addition to the notebook plots.
+        The curves use the number of frames as step, so resuming a run with the same directory continues them.
         """
+        hparams = {k: v for k, v in locals().items() if k not in ('self', 'log_file', 'test_env', 'tensorboard')}
 
         if num_envs == -1:
             num_envs = mp.cpu_count()
+        hparams['num_envs'] = num_envs
         env = self.make_env()()
         if vec_env == 'auto':
             vec_env = 'dummy' if len(env.observation_space.shape) == 1 else 'subproc'
+        hparams['vec_env'] = vec_env
         envs = (DummyVecEnv if vec_env == 'dummy' else SubprocVecEnv)([self.make_env() for _ in range(num_envs)])
         eval_env = env if test_env is None else test_env
+        tb = None
 
         try:
+            tb = TensorBoardLogger.resolve(tensorboard)
             if not hasattr(self, 'policy'):
                 self.make_net()
             if not hasattr(self, 'optimizer'):
@@ -364,6 +396,13 @@ class PPO(object):
                 self.prev_time_elapsed = 0
             if not hasattr(self, 'opt_info'):
                 self.opt_info = []
+            if tb is not None:
+                sample_obs, _ = env.reset()
+                tb.log_setup(self.policy, to_tensor(np.asarray(sample_obs)[None], self.device), hparams,
+                             metrics=['eval/reward'], layout=TENSORBOARD_LAYOUT,
+                             run_info={'observation space': env.observation_space, 'action space': env.action_space,
+                                       'resumed at frame': self.frame_idx})
+                tb.log_observation(sample_obs)
 
             # the rollout is stored on the device, so that the update never moves data across it
             device = self.device
@@ -386,6 +425,9 @@ class PPO(object):
             start_learning = time.time()
             start_cycle = time.time()
             start_cycle_frames = self.frame_idx
+            episode_return = np.zeros(num_envs)
+            episode_length = np.zeros(num_envs, dtype=np.int64)
+            finished_episodes = deque(maxlen=100)  # (return, length) of the latest episodes
             state = envs.reset()
             while True:
 
@@ -409,6 +451,12 @@ class PPO(object):
                             final_value = self.policy.get_value(to_tensor(final_obs, device)).cpu().numpy()
                             reward_buf[step, cut_off] += gamma * final_value
 
+                        episode_return += reward
+                        episode_length += 1
+                        for i in np.flatnonzero(terminated | truncated):
+                            finished_episodes.append((episode_return[i], episode_length[i]))
+                            episode_return[i] = episode_length[i] = 0
+
                         state = next_state
                         self.frame_idx += num_envs
 
@@ -425,10 +473,27 @@ class PPO(object):
                                        progress=min(self.frame_idx / max_frames, 1.0), std_decay=std_decay,
                                        clip_log_std=clip_log_std)
                 ppo_cycles += 1
+                if tb is not None:
+                    progress = min(self.frame_idx / max_frames, 1.0)
+                    tb.update(self.frame_idx, _opt_info, log_std=not self.policy.discrete)
+                    tb.scalars(self.frame_idx, {'progress': progress}, 'schedule/')
+                    tb.scalars(self.frame_idx, {
+                        'explained_variance': explained_variance(value_buf.flatten(), returns.flatten()),
+                        'value_mean': value_buf.mean().item(), 'return_mean': returns.mean().item(),
+                        'reward_mean': reward_buf.mean(),
+                        **({'ep_return_mean': np.mean([r for r, _ in finished_episodes]),
+                            'ep_length_mean': np.mean([n for _, n in finished_episodes])}
+                           if finished_episodes else {})}, 'rollout/')
                 if ppo_cycles % log_every == 0:
                     fps = int((self.frame_idx - start_cycle_frames) / (time.time() - start_cycle))
+                    if tb is not None:
+                        n_actions = self.policy.actor.out_features
+                        tb.histogram(self.frame_idx, 'rollout/actions', action_buf,
+                                     bins=np.arange(n_actions + 1) - 0.5 if self.policy.discrete else 'tensorflow')
+                        tb.histogram(self.frame_idx, 'rollout/values', value_buf)
+                        tb.histogram(self.frame_idx, 'rollout/returns', returns)
                     test_reward = self.log_progress(eval_env, runs_for_episode, test_episodes, _opt_info, fps,
-                                                    start_learning, log_file)
+                                                    start_learning, log_file, tb)
                     logged_cycle = ppo_cycles
                     start_cycle = time.time()
                     start_cycle_frames = self.frame_idx
@@ -442,7 +507,10 @@ class PPO(object):
                 print('> Max reward target reached!')
             elif logged_cycle != ppo_cycles:
                 fps = int((self.frame_idx - start_cycle_frames) / (time.time() - start_cycle))
-                self.log_progress(eval_env, runs_for_episode, test_episodes, _opt_info, fps, start_learning, log_file)
+                self.log_progress(eval_env, runs_for_episode, test_episodes, _opt_info, fps, start_learning, log_file,
+                                  tb)
         finally:
+            if tb is not None and tb is not tensorboard:
+                tb.close()  # only the loggers created here are closed
             envs.close()
             env.close()
